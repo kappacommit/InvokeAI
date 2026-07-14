@@ -7,10 +7,9 @@ Anima uses a dual-conditioning scheme:
 Both are produced by the text encoder invocation and stored together.
 
 For regional prompting, multiple conditionings (each with an optional spatial mask)
-are concatenated and processed together. The LLM Adapter runs on each region's
-conditioning separately, producing per-region context vectors that are concatenated
-for the DiT's cross-attention layers. An attention mask restricts which image tokens
-attend to which regional context tokens.
+are processed together. The LLM Adapter runs on each region's conditioning
+separately, producing per-slot context vectors that are blended spatially during
+denoising (see invokeai.backend.anima.regional_prompting).
 """
 
 from dataclasses import dataclass
@@ -46,8 +45,8 @@ class AnimaRegionalTextConditioning:
     """Container for multiple regional text conditionings processed by the LLM Adapter.
 
     After the LLM Adapter processes each region's conditioning, the outputs are concatenated.
-    The DiT cross-attention then uses an attention mask to restrict which image tokens
-    attend to which region's context tokens.
+    During denoising, each slot's context is blended spatially with the region masks
+    via attention couple (see invokeai.backend.anima.regional_prompting).
 
     Attributes:
         context_embeds: Concatenated LLM Adapter outputs from all regional prompts.

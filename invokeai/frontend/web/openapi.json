@@ -10801,7 +10801,7 @@
         "tags": ["image", "anima"],
         "title": "Denoise - Anima",
         "type": "object",
-        "version": "1.8.0",
+        "version": "1.9.0",
         "output": {
           "$ref": "#/components/schemas/LatentsOutput"
         }

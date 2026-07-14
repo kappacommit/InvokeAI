@@ -42,7 +42,7 @@ from invokeai.app.invocations.latent_noise import validate_noise_tensor_shape
 from invokeai.app.invocations.model import TransformerField
 from invokeai.app.invocations.primitives import LatentsOutput
 from invokeai.app.services.shared.invocation_context import InvocationContext
-from invokeai.backend.anima.anima_transformer_patch import patch_anima_for_regional_prompting
+from invokeai.backend.anima.anima_transformer_patch import patch_anima_for_attention_couple
 from invokeai.backend.anima.conditioning_data import AnimaRegionalTextConditioning, AnimaTextConditioning
 from invokeai.backend.anima.control_net_lllite import (
     AnimaControlNetLLLite,
@@ -50,7 +50,10 @@ from invokeai.backend.anima.control_net_lllite import (
     prepare_cond_image,
     prepare_mask,
 )
-from invokeai.backend.anima.regional_prompting import AnimaRegionalPromptingExtension
+from invokeai.backend.anima.regional_prompting import (
+    AnimaAttentionCoupleExtension,
+    preprocess_regional_prompt_mask,
+)
 from invokeai.backend.anima.scheduler_driver import AnimaSchedulerDriver
 from invokeai.backend.flux.schedulers import (
     ANIMA_SCHEDULER_LABELS,
@@ -177,7 +180,7 @@ class AnimaInpaintExtension(RectifiedFlowInpaintExtension):
     title="Denoise - Anima",
     tags=["image", "anima"],
     category="image",
-    version="1.8.0",
+    version="1.9.0",
     classification=Classification.Prototype,
 )
 class AnimaDenoiseInvocation(BaseInvocation):
@@ -425,8 +428,8 @@ class AnimaDenoiseInvocation(BaseInvocation):
         Args:
             context: The invocation context.
             cond_field: Single conditioning field or list of fields.
-            img_token_height: Height of the image token grid (H // patch_size).
-            img_token_width: Width of the image token grid (W // patch_size).
+            img_token_height: Height of the image token grid (ceil(latent_H / patch_size)).
+            img_token_width: Width of the image token grid (ceil(latent_W / patch_size)).
             dtype: Target dtype.
             device: Target device.
 
@@ -442,11 +445,8 @@ class AnimaDenoiseInvocation(BaseInvocation):
             # Load the mask, if provided
             mask: torch.Tensor | None = None
             if cond.mask is not None:
-                mask = context.tensors.load(cond.mask.tensor_name)
-                mask = mask.to(device=device)
-                mask = AnimaRegionalPromptingExtension.preprocess_regional_prompt_mask(
-                    mask, img_token_height, img_token_width, dtype, device
-                )
+                raw_mask = context.tensors.load(cond.mask.tensor_name).to(device=device)
+                mask = preprocess_regional_prompt_mask(raw_mask, img_token_height, img_token_width, dtype, device)
 
             text_conditionings.append(
                 AnimaTextConditioning(
@@ -527,8 +527,10 @@ class AnimaDenoiseInvocation(BaseInvocation):
         patch_size = 2
         latent_height = self.height // ANIMA_LATENT_SCALE_FACTOR
         latent_width = self.width // ANIMA_LATENT_SCALE_FACTOR
-        img_token_height = latent_height // patch_size
-        img_token_width = latent_width // patch_size
+        # The transformer pads the latent up to a multiple of the patch size, so the
+        # token grid uses ceil division.
+        img_token_height = math.ceil(latent_height / patch_size)
+        img_token_width = math.ceil(latent_width / patch_size)
         img_seq_len = img_token_height * img_token_width
 
         # Load positive conditioning with optional regional masks
@@ -540,7 +542,8 @@ class AnimaDenoiseInvocation(BaseInvocation):
             dtype=inference_dtype,
             device=device,
         )
-        has_regional = len(pos_text_conditionings) > 1 or any(tc.mask is not None for tc in pos_text_conditionings)
+        has_regional_masks = any(tc.mask is not None for tc in pos_text_conditionings)
+        has_regional = len(pos_text_conditionings) > 1 or has_regional_masks
 
         # Load negative conditioning if CFG is enabled
         do_cfg = not math.isclose(self.guidance_scale, 1.0) and self.negative_conditioning is not None
@@ -575,6 +578,19 @@ class AnimaDenoiseInvocation(BaseInvocation):
             # Anima denoiser works in 3D: add temporal dim if needed
             if init_latents.ndim == 4:
                 init_latents = init_latents.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+
+            # Regional blend weights are built on the grids derived from the width/height
+            # fields. If the input latents disagree, the weights would map to wrong spatial
+            # positions (undetectable downstream when the token counts happen to match,
+            # e.g. swapped W/H).
+            if has_regional_masks:
+                actual_h, actual_w = int(init_latents.shape[-2]), int(init_latents.shape[-1])
+                if (actual_h, actual_w) != (latent_height, latent_width):
+                    raise ValueError(
+                        f"Regional guidance requires the width/height fields to match the input latents. "
+                        f"Fields imply a {latent_width}x{latent_height} latent, but the input latents are "
+                        f"{actual_w}x{actual_h}."
+                    )
 
         # Generate initial noise (3D latent: [B, C, T, H, W]).
         # If noise will never be consumed, avoid validating/loading it.
@@ -696,14 +712,15 @@ class AnimaDenoiseInvocation(BaseInvocation):
 
             # Run LLM Adapter for each regional conditioning to produce context vectors.
             # This must happen with the transformer on device since it uses the adapter weights.
+            attention_coupling: AnimaAttentionCoupleExtension | None = None
             if has_regional:
                 pos_regional = self._run_llm_adapter_for_regions(transformer, pos_text_conditionings, inference_dtype)
                 pos_context = pos_regional.context_embeds.unsqueeze(0)  # (1, total_ctx_len, 1024)
 
-                # Build regional prompting extension with cross-attention mask
-                regional_extension = AnimaRegionalPromptingExtension.from_regional_conditioning(
-                    pos_regional, img_seq_len
-                )
+                if has_regional_masks:
+                    attention_coupling = AnimaAttentionCoupleExtension.from_regional_conditioning(
+                        pos_regional, img_seq_len, device, inference_dtype
+                    )
 
                 # For negative, concatenate all regions without masking (matches Z-Image behavior)
                 neg_context = None
@@ -744,10 +761,8 @@ class AnimaDenoiseInvocation(BaseInvocation):
                         t5xxl_weights=neg_weights.to(dtype=inference_dtype) if neg_weights is not None else None,
                     )
 
-                regional_extension = None
-
-            # Apply regional prompting patch if we have regional masks
-            exit_stack.enter_context(patch_anima_for_regional_prompting(transformer, regional_extension))
+            # Apply the attention-couple patch if that region mode is active
+            exit_stack.enter_context(patch_anima_for_attention_couple(transformer, attention_coupling))
 
             # Helper to run transformer with pre-computed context (bypasses LLM Adapter)
             def _run_transformer(ctx: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -757,6 +772,24 @@ class AnimaDenoiseInvocation(BaseInvocation):
                     context=ctx,
                     # t5xxl_ids=None skips the LLM Adapter — context is already pre-computed
                 )
+
+            def _predict_noise(latents: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+                """Run the CFG prediction for one step, applying regional coupling if configured."""
+                if attention_coupling is not None:
+                    # Attention couple: a single forward; the patched cross-attention blends
+                    # per-slot outputs. Coupling applies to the cond pass only.
+                    attention_coupling.coupling_enabled = True
+                    try:
+                        noise_pred_cond = _run_transformer(pos_context, latents, timestep).float()
+                    finally:
+                        attention_coupling.coupling_enabled = False
+                else:
+                    noise_pred_cond = _run_transformer(pos_context, latents, timestep).float()
+
+                if do_cfg and neg_context is not None:
+                    noise_pred_uncond = _run_transformer(neg_context, latents, timestep).float()
+                    return noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                return noise_pred_cond
 
             try:
                 # Bind AFTER LoRA patching so the LLLite modules wrap the patched
@@ -780,13 +813,7 @@ class AnimaDenoiseInvocation(BaseInvocation):
                             [it.sigma_curr * ANIMA_MULTIPLIER], device=device, dtype=inference_dtype
                         ).expand(latents.shape[0])
 
-                        noise_pred_cond = _run_transformer(pos_context, latents, timestep).float()
-
-                        if do_cfg and neg_context is not None:
-                            noise_pred_uncond = _run_transformer(neg_context, latents, timestep).float()
-                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                        else:
-                            noise_pred = noise_pred_cond
+                        noise_pred = _predict_noise(latents, timestep)
 
                         latents_preview = self._estimate_preview_latents(
                             latents=latents,
@@ -834,13 +861,7 @@ class AnimaDenoiseInvocation(BaseInvocation):
                             [sigma_curr * ANIMA_MULTIPLIER], device=device, dtype=inference_dtype
                         ).expand(latents.shape[0])
 
-                        noise_pred_cond = _run_transformer(pos_context, latents, timestep).float()
-
-                        if do_cfg and neg_context is not None:
-                            noise_pred_uncond = _run_transformer(neg_context, latents, timestep).float()
-                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                        else:
-                            noise_pred = noise_pred_cond
+                        noise_pred = _predict_noise(latents, timestep)
 
                         latents_dtype = latents.dtype
                         latents = latents.to(dtype=torch.float32)
